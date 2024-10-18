@@ -15,17 +15,19 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressStyle};
 use symsrv::{SymSrvList, SymSrvSpec};
 
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::string;
 
 use futures::{stream, Stream, StreamExt};
 use indicatif::ProgressBar;
-use tokio::{
-    fs::{self, DirEntry},
-    io::AsyncWriteExt,
+use tokio::fs::{
+    self, DirEntry,
 };
+use walkdir::WalkDir;
+
 
 use symsrv::{nonblocking::SymSrv, DownloadError, DownloadStatus, SymFileInfo};
 
@@ -484,11 +486,8 @@ async fn run() -> anyhow::Result<()> {
     match args.command {
         Command::Manifest { filepath, manifest } => {
             /* List all files in the directory specified by args[2] */
-            let listing: Vec<Result<DirEntry, io::Error>> =
-                recursive_listdir(filepath).collect().await;
-
+            let listing: Vec<walkdir::DirEntry> = WalkDir::new(filepath.to_str().unwrap()).into_iter().filter_map(Result::ok).collect();
             let pb = ProgressBar::new(listing.len() as u64);
-
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template(
@@ -499,32 +498,31 @@ async fn run() -> anyhow::Result<()> {
             );
 
             // Map the listing into strings to write into the manifest
-            let tasks: Vec<_> = listing
-                .into_iter()
-                .filter_map(move |e| {
-                    let pb = pb.clone();
-
-                    match e {
-                        Ok(e) => Some(tokio::spawn(async move {
-                            pb.inc(1);
-
-                            match get_pdb(&e.path()) {
-                                Ok(manifest_str) => Some(manifest_str),
-                                Err(_) => None,
-                            }
-                        })),
-
-                        Err(_) => None,
-                    }
-                })
-                .collect();
-
             let manifest_path = manifest.unwrap_or(PathBuf::from("manifest"));
-            let mut output_file = tokio::fs::File::create(manifest_path)
-                .await
+            let mut output_file = std::fs::File::create(manifest_path)
                 .context("Failed to create output manifest file")?;
 
-            for task in tasks {
+                for i in  listing
+                .iter(){
+                    let pb = pb.clone();
+
+                    pb.inc(1);
+
+                    match get_pdb(&i.path()) {
+                        Ok(manifest_str) => Some(output_file
+                            .write_fmt(format_args!("{manifest_str}\n"))//, &manifest_str)
+                            .context("Failed to write to output manifest file")),
+                        Err(_) => None,
+                    };
+                }
+
+                            
+                //.collect();
+
+            
+            
+
+            /*for task in tasks {
                 if let Some(e) = task.await.unwrap() {
                     output_file
                         .write(format!("{}\n", &e).as_bytes())
@@ -532,6 +530,7 @@ async fn run() -> anyhow::Result<()> {
                         .context("Failed to write to output manifest file")?;
                 }
             }
+                */
         }
         Command::Download { manifest, symsrv } => {
             /* Read the entire manifest file into a string */

@@ -1,3 +1,7 @@
+# Fork info
+
+This fork changed the manifest to not use tokyo - to solve a problem with too many files are open.
+
 # Summary
 
 This is a tiny **unofficial** project meant to be a quick alternative to symchk for
