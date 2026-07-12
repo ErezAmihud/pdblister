@@ -22,10 +22,7 @@ use std::str::FromStr;
 
 use futures::{stream, Stream, StreamExt};
 use indicatif::ProgressBar;
-use tokio::{
-    fs::{self, DirEntry},
-    io::AsyncWriteExt,
-};
+use tokio::{fs, io::AsyncWriteExt};
 
 use symsrv::{nonblocking::SymSrv, DownloadError, DownloadStatus, SymFileInfo};
 
@@ -41,10 +38,15 @@ pub enum MessageFormat {
 
 /// Given a `path`, return a stream of all the files recursively found from
 /// that path.
+///
+/// This yields plain paths rather than `DirEntry` values: on some platforms
+/// a `DirEntry` keeps its parent directory's handle open, so holding onto
+/// many of them at once (e.g. collecting them into a `Vec`) exhausts the
+/// process's file handle limit on large directory trees.
 fn recursive_listdir(
     path: impl Into<PathBuf>,
-) -> impl Stream<Item = io::Result<DirEntry>> + Send + 'static {
-    async fn one_level(path: PathBuf, to_visit: &mut Vec<PathBuf>) -> io::Result<Vec<DirEntry>> {
+) -> impl Stream<Item = io::Result<PathBuf>> + Send + 'static {
+    async fn one_level(path: PathBuf, to_visit: &mut Vec<PathBuf>) -> io::Result<Vec<PathBuf>> {
         let mut dir = fs::read_dir(path).await?;
         let mut files = Vec::new();
 
@@ -52,7 +54,7 @@ fn recursive_listdir(
             if child.metadata().await?.is_dir() {
                 to_visit.push(child.path());
             } else {
-                files.push(child)
+                files.push(child.path())
             }
         }
 
@@ -484,7 +486,7 @@ async fn run() -> anyhow::Result<()> {
     match args.command {
         Command::Manifest { filepath, manifest } => {
             /* List all files in the directory specified by args[2] */
-            let listing: Vec<Result<DirEntry, io::Error>> =
+            let listing: Vec<Result<PathBuf, io::Error>> =
                 recursive_listdir(filepath).collect().await;
 
             let pb = ProgressBar::new(listing.len() as u64);
@@ -498,36 +500,33 @@ async fn run() -> anyhow::Result<()> {
                     .progress_chars("##-"),
             );
 
-            // Map the listing into strings to write into the manifest
-            let tasks: Vec<_> = listing
-                .into_iter()
-                .filter_map(move |e| {
-                    let pb = pb.clone();
-
-                    match e {
-                        Ok(e) => Some(tokio::spawn(async move {
-                            pb.inc(1);
-
-                            match get_pdb(&e.path()) {
-                                Ok(manifest_str) => Some(manifest_str),
-                                Err(_) => None,
-                            }
-                        })),
-
-                        Err(_) => None,
-                    }
-                })
-                .collect();
-
             let manifest_path = manifest.unwrap_or(PathBuf::from("manifest"));
             let mut output_file = tokio::fs::File::create(manifest_path)
                 .await
                 .context("Failed to create output manifest file")?;
 
-            for task in tasks {
-                if let Some(e) = task.await.unwrap() {
+            // Map the listing into strings to write into the manifest.
+            // N.B: The number of tasks in flight is bounded so that we don't
+            // exhaust the process's file handle limit on large trees.
+            let mut tasks = futures::stream::iter(listing.into_iter().filter_map(|e| {
+                let pb = pb.clone();
+
+                match e {
+                    Ok(path) => Some(tokio::task::spawn_blocking(move || {
+                        pb.inc(1);
+
+                        get_pdb(&path).ok()
+                    })),
+
+                    Err(_) => None,
+                }
+            }))
+            .buffer_unordered(32);
+
+            while let Some(task) = tasks.next().await {
+                if let Some(e) = task.unwrap() {
                     output_file
-                        .write(format!("{}\n", &e).as_bytes())
+                        .write_all(format!("{}\n", &e).as_bytes())
                         .await
                         .context("Failed to write to output manifest file")?;
                 }
@@ -639,8 +638,8 @@ async fn run() -> anyhow::Result<()> {
 
             listing
                 .for_each(|entry| async {
-                    if let Ok(e) = entry {
-                        if let Ok(fsname) = get_file_path(&e.path()) {
+                    if let Ok(path) = entry {
+                        if let Ok(fsname) = get_file_path(&path) {
                             let fsname = target.join(&fsname);
 
                             if !fsname.exists() {
@@ -649,8 +648,8 @@ async fn run() -> anyhow::Result<()> {
                                     .await
                                     .expect("Failed to create filestore directory");
 
-                                if let Err(err) = tokio::fs::copy(&e.path(), fsname).await {
-                                    println!("Failed to copy file {:?}: {err:#}", &e.path());
+                                if let Err(err) = tokio::fs::copy(&path, fsname).await {
+                                    println!("Failed to copy file {:?}: {err:#}", &path);
                                 }
                             }
                         }
@@ -667,8 +666,8 @@ async fn run() -> anyhow::Result<()> {
 
             listing
                 .for_each(|entry| async {
-                    if let Ok(e) = entry {
-                        if let Ok(fsname) = get_pdb_path(&e.path()) {
+                    if let Ok(path) = entry {
+                        if let Ok(fsname) = get_pdb_path(&path) {
                             let fsname = targetpath.join(&fsname);
 
                             if !fsname.exists() {
@@ -677,8 +676,8 @@ async fn run() -> anyhow::Result<()> {
                                     .await
                                     .expect("Failed to create filestore directory");
 
-                                if let Err(err) = tokio::fs::copy(&e.path(), fsname).await {
-                                    println!("Failed to copy file {:?}: {err:#}", &e.path());
+                                if let Err(err) = tokio::fs::copy(&path, fsname).await {
+                                    println!("Failed to copy file {:?}: {err:#}", &path);
                                 }
                             }
                         }
