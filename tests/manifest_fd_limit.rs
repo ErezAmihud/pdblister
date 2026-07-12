@@ -141,7 +141,7 @@ fn manifest_survives_low_file_handle_limit() {
         .arg(&manifest)
         .status()
         .expect("failed to spawn pdblister");
-    assert!(status.success(), "pdblister manifest exited with {status}");
+    assert!(status.success(), "{}", "pdblister manifest exited with {status}");
 
     let contents = fs::read_to_string(&manifest).expect("manifest file was not created");
     let mut names: Vec<&str> = contents
