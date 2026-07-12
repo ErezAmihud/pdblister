@@ -14,6 +14,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use object::pe;
+use object::write::pe::{NtHeaders, Writer};
+use object::{LittleEndian as LE, U16, U32};
+
 /// Number of directories (each holding one PE file) in the generated tree.
 /// Must comfortably exceed `FD_LIMIT` for the test to be meaningful.
 const NUM_DIRS: usize = 1024;
@@ -21,81 +25,82 @@ const NUM_DIRS: usize = 1024;
 /// Soft file handle limit imposed on the pdblister process.
 const FD_LIMIT: usize = 256;
 
-/// Build a minimal PE image containing an RSDS codeview entry referencing
-/// `pdb_name`, just enough for `get_pdb` to extract a manifest line from it.
+/// Build a minimal PE image containing an RSDS codeview debug entry
+/// referencing `pdb_name`, just enough for `get_pdb` to extract a manifest
+/// line from it.
 fn make_pe(pdb_name: &str, guid_seed: u64) -> Vec<u8> {
-    const NUM_TABLES: u32 = 16;
-    // Field offsets below follow the packed structs in src/pe.rs.
-    let opt_size = 112 + NUM_TABLES as usize * 8;
-    let sec_table_off = 0x40 + 0x18 + opt_size; // 328
-    let debug_raw_off = (sec_table_off + 40) as u32; // 368
-    let cv_off = debug_raw_off + 28; // 396
-
-    // MZHeader
-    let mut mz = [0u8; 0x40];
-    mz[0..2].copy_from_slice(b"MZ");
-    mz[60..64].copy_from_slice(&0x40u32.to_le_bytes()); // new_header
-
-    // PEHeader
-    let mut pe = Vec::with_capacity(0x18);
-    pe.extend_from_slice(b"PE\0\0");
-    pe.extend_from_slice(&0x8664u16.to_le_bytes()); // machine (AMD64)
-    pe.extend_from_slice(&1u16.to_le_bytes()); // num_sections
-    pe.extend_from_slice(&0x5F00_0000u32.to_le_bytes()); // timestamp
-    pe.extend_from_slice(&[0u8; 8]); // ptr_symtable, num_smtable
-    pe.extend_from_slice(&(opt_size as u16).to_le_bytes());
-    pe.extend_from_slice(&0x22u16.to_le_bytes()); // characteristics
-
-    // WindowsPEHeader64
-    let mut opt = [0u8; 112];
-    opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes()); // magic (PE32+)
-    opt[24..32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // image_base
-    opt[32..36].copy_from_slice(&0x1000u32.to_le_bytes()); // section_align
-    opt[36..40].copy_from_slice(&0x200u32.to_le_bytes()); // file_align
-    opt[56..60].copy_from_slice(&0x3000u32.to_le_bytes()); // size_of_image
-    opt[60..64].copy_from_slice(&0x400u32.to_le_bytes()); // size_of_headers
-    opt[68..70].copy_from_slice(&2u16.to_le_bytes()); // subsystem
-    opt[108..112].copy_from_slice(&NUM_TABLES.to_le_bytes());
-
-    // Data directories; entry 6 is the debug directory.
-    let mut datadirs = [0u8; (NUM_TABLES * 8) as usize];
-    datadirs[48..52].copy_from_slice(&0x1000u32.to_le_bytes()); // vaddr
-    datadirs[52..56].copy_from_slice(&28u32.to_le_bytes()); // size
-
-    // One section mapping vaddr 0x1000 to the debug directory's file offset.
-    let mut section = [0u8; 40];
-    section[0..8].copy_from_slice(b".rdata\0\0");
-    section[8..12].copy_from_slice(&0x200u32.to_le_bytes()); // vsize
-    section[12..16].copy_from_slice(&0x1000u32.to_le_bytes()); // vaddr
-    section[16..20].copy_from_slice(&0x200u32.to_le_bytes()); // raw_data_size
-    section[20..24].copy_from_slice(&debug_raw_off.to_le_bytes());
-
-    // ImageDebugDirectory (type 2 = codeview)
-    let cv_size = 24 + pdb_name.len() as u32 + 1;
-    let mut debug_dir = [0u8; 28];
-    debug_dir[12..16].copy_from_slice(&2u32.to_le_bytes()); // typ
-    debug_dir[16..20].copy_from_slice(&cv_size.to_le_bytes()); // size_of_data
-    debug_dir[24..28].copy_from_slice(&cv_off.to_le_bytes());
-
-    // CodeviewEntry followed by the null-terminated PDB path.
-    let mut cv = Vec::with_capacity(cv_size as usize);
+    // RSDS codeview record: signature, GUID, age, then the PDB path.
+    let mut cv = Vec::new();
     cv.extend_from_slice(b"RSDS");
-    cv.extend_from_slice(&(guid_seed as u32).to_le_bytes()); // guid_a
-    cv.extend_from_slice(&((guid_seed >> 32) as u16).to_le_bytes()); // guid_b
-    cv.extend_from_slice(&((guid_seed >> 48) as u16).to_le_bytes()); // guid_c
-    cv.extend_from_slice(&guid_seed.to_le_bytes()); // guid_d
+    cv.extend_from_slice(&(guid_seed as u32).to_le_bytes());
+    cv.extend_from_slice(&((guid_seed >> 32) as u16).to_le_bytes());
+    cv.extend_from_slice(&((guid_seed >> 48) as u16).to_le_bytes());
+    cv.extend_from_slice(&guid_seed.to_le_bytes());
     cv.extend_from_slice(&1u32.to_le_bytes()); // age
     cv.extend_from_slice(pdb_name.as_bytes());
     cv.push(0);
 
+    let debug_dir_len = std::mem::size_of::<pe::ImageDebugDirectory>() as u32;
+    let section_len = debug_dir_len + cv.len() as u32;
+
     let mut out = Vec::new();
-    out.extend_from_slice(&mz);
-    out.extend_from_slice(&pe);
-    out.extend_from_slice(&opt);
-    out.extend_from_slice(&datadirs);
-    out.extend_from_slice(&section);
-    out.extend_from_slice(&debug_dir);
-    out.extend_from_slice(&cv);
+    let mut writer = Writer::new(true, 0x1000, 0x200, &mut out);
+
+    writer.reserve_dos_header();
+    writer.reserve_nt_headers(pe::IMAGE_NUMBEROF_DIRECTORY_ENTRIES);
+    writer.reserve_section_headers(1);
+    let range = writer.reserve_section(
+        *b".rdata\0\0",
+        pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_READ,
+        section_len,
+        section_len,
+    );
+    writer.set_data_directory(
+        pe::IMAGE_DIRECTORY_ENTRY_DEBUG,
+        range.virtual_address,
+        debug_dir_len,
+    );
+
+    writer.write_empty_dos_header().unwrap();
+    writer.write_nt_headers(NtHeaders {
+        machine: pe::IMAGE_FILE_MACHINE_AMD64,
+        time_date_stamp: 0x5F00_0000,
+        characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE,
+        major_linker_version: 0,
+        minor_linker_version: 0,
+        address_of_entry_point: 0,
+        image_base: 0x1_4000_0000,
+        major_operating_system_version: 0,
+        minor_operating_system_version: 0,
+        major_image_version: 0,
+        minor_image_version: 0,
+        major_subsystem_version: 0,
+        minor_subsystem_version: 0,
+        subsystem: pe::IMAGE_SUBSYSTEM_WINDOWS_CUI,
+        dll_characteristics: 0,
+        size_of_stack_reserve: 0,
+        size_of_stack_commit: 0,
+        size_of_heap_reserve: 0,
+        size_of_heap_commit: 0,
+    });
+    writer.write_section_headers();
+
+    // The section holds the debug directory itself, immediately followed by
+    // the codeview record it points at.
+    let debug_dir = pe::ImageDebugDirectory {
+        characteristics: U32::new(LE, 0),
+        time_date_stamp: U32::new(LE, 0),
+        major_version: U16::new(LE, 0),
+        minor_version: U16::new(LE, 0),
+        typ: U32::new(LE, pe::IMAGE_DEBUG_TYPE_CODEVIEW),
+        size_of_data: U32::new(LE, cv.len() as u32),
+        address_of_raw_data: U32::new(LE, range.virtual_address + debug_dir_len),
+        pointer_to_raw_data: U32::new(LE, range.file_offset + debug_dir_len),
+    };
+    let mut content = object::bytes_of(&debug_dir).to_vec();
+    content.extend_from_slice(&cv);
+    writer.write_section(range.file_offset, &content);
+
     out
 }
 
