@@ -35,7 +35,6 @@ jobs:
 
   upload-assets:
     name: ${{ matrix.target }}
-    if: github.repository_owner == 'microsoft'
     needs: create-release
     strategy:
       matrix:
