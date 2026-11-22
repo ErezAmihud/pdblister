@@ -1,5 +1,7 @@
 # Summary
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/ErezAmihud/pdblister?utm_source=badge)
+
 This is a tiny **unofficial** project meant to be a quick alternative to symchk for
 miscellaneous tasks, such as generating manifests and downloading symbols. This
 mimics symchk of the form `symchk /om manifest /r <path>` but only looks for MZ/PE files.
@@ -57,3 +59,16 @@ Then for downloads it chomps through a manifest file asynchronously, at up to
 16 files at the same time! The original `symchk` only peaks at about 3-4 Mbps
 of network usage, but this tool saturates my internet connection at
 400 Mbps.
+
+## Benchmarks
+
+Performance is tracked with [CodSpeed](https://codspeed.io) on every pull request.
+The benchmarks in `codspeed.yml` run `pdblister manifest` on generated directory
+trees of PE files. To run them locally (Linux, with the
+[CodSpeed CLI](https://codspeed.io/docs/cli) installed):
+
+```
+cargo build --release
+cargo run --release --example gen_bench_tree
+codspeed run -m simulation
+```

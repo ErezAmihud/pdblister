@@ -1,0 +1,38 @@
+name: CodSpeed
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Allow CodSpeed to trigger backtest performance analysis
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC authentication with CodSpeed
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build pdblister
+        run: cargo build --release
+
+      - name: Generate benchmark input trees
+        run: cargo run --release --example gen_bench_tree
+
+      # Runs the benchmarks defined in codspeed.yml
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
