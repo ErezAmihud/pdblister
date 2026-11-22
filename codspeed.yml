@@ -1,0 +1,18 @@
+$schema: https://raw.githubusercontent.com/CodSpeedHQ/codspeed/refs/heads/main/schemas/codspeed.schema.json
+
+# End-to-end benchmarks of the `pdblister` CLI, run with `codspeed run`.
+# Build the binary and generate the input trees first:
+#
+#   cargo build --release
+#   cargo run --release --example gen_bench_tree
+#
+# Paths are relative to the repository root.
+
+benchmarks:
+  # ~8000 files, half of them PEs, in a wide tree like C:\Windows\System32.
+  - name: manifest_system32
+    exec: ./target/release/pdblister manifest target/bench-data/system32 target/bench-data/manifest_system32
+
+  # 2048 nested directories, each with one PE and one other file.
+  - name: manifest_deep_tree
+    exec: ./target/release/pdblister manifest target/bench-data/deep target/bench-data/manifest_deep
